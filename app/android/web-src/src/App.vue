@@ -3161,9 +3161,10 @@ const loadModel = async () => {
 	const name = model?.name ?? id
 	loading.value = true; error.value = ""; ready.value = false
 	motions.value = []; expressions.value = []
+	let entryBase = ""
 	try {
 		loadingMsg.value = `下载 ${name}…`
-		const entryBase = await ensureModel(id, name)
+		entryBase = await ensureModel(id, name)
 		loadingMsg.value = "加载中…"
 		await l2d.destroy()
 		// 换模型后重置注视状态 (眼珠由库 drag 源驱动, 随模型重建自动归位)
@@ -3202,7 +3203,18 @@ const loadModel = async () => {
 		ready.value = true
 		loadTouchForModel(id)
 	} catch (e: any) {
-		error.value = e?.message ?? String(e)
+		// 2026-11-03: 失败时把候选地址的响应码一并显示，否则只看到「模型加载失败」无从下手
+		const info: string[] = []
+		try {
+			const cands = [`${id}/${entryBase}/${entryBase}.model3.json`, `${id}/${entryBase}.model3.json`]
+			for (const c of cands) {
+				try {
+					const r = await fetch(`live2d/${c}`)
+					info.push(`${c}→${r.status}`)
+				} catch { info.push(`${c}→ERR`) }
+			}
+		} catch { /* 忽略 */ }
+		error.value = (e?.message ?? String(e)) + (info.length ? " ｜ " + info.join(" , ") : "")
 	} finally {
 		loading.value = false
 		modelSwitching = false   // 释放守卫 (必须在 finally: 失败/超时路径也要放)
