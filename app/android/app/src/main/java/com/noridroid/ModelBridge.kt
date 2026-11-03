@@ -34,6 +34,16 @@ class ModelBridge(private val appContext: Context) {
         // 与写文件之间互踩, 损坏模型目录且无自愈. 静态 = 跨实例生效 (主界面/悬浮窗各有
         // 一个 ModelBridge 实例, 各带自己的线程池).
         private val downloadLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
+        // ===== 自定义模型导入（2026-11-03 新增）=====
+        /** zip 本体上限 */
+        private const val IMPORT_MAX_ZIP_BYTES = 200L * 1024 * 1024
+        /** 解压后累计上限 */
+        private const val IMPORT_MAX_TOTAL_BYTES = 600L * 1024 * 1024
+        /** 解压后单文件上限 */
+        private const val IMPORT_MAX_ENTRY_BYTES = 100L * 1024 * 1024
+        /** 条目数上限 */
+        private const val IMPORT_MAX_ENTRIES = 8000
     }
 
     private fun lockFor(id: String): Any = downloadLocks.computeIfAbsent(id) { Any() }
@@ -69,7 +79,156 @@ class ModelBridge(private val appContext: Context) {
         }
     }
 
-    
+    // ================= 自定义模型导入（2026-11-03 新增）=================
+
+    /**
+     * 从系统文件选择器选中的 ZIP 导入模型。
+     * 前端调用链：window.NoriImport.pick() → 原生选择器 → 本方法 → window.__noriModelImportRes(json)
+     * 返回 JSON：{ok:true,id,entryBase} 或 {ok:false,message}
+     */
+    @android.webkit.JavascriptInterface
+    fun importZip(uriString: String) {
+        ioExecutor.execute {
+            val json = synchronized(lockFor("__import__")) {
+                runCatching { installFromUri(android.net.Uri.parse(uriString)) }
+                    .getOrElse { e -> err(e.message ?: "导入失败") }
+            }
+            postToJs("__noriModelImportRes", json)
+        }
+    }
+
+    private fun installFromUri(uri: android.net.Uri): String {
+        val resolver = appContext.contentResolver
+        modelsDir.mkdirs()
+        val tmp = File(modelsDir, ".import.zip.tmp")
+        val staging = File(modelsDir, ".import.staging.tmp")
+        try {
+            // 1) 流式复制到临时文件，同时限制体积
+            var written = 0L
+            val input = resolver.openInputStream(uri) ?: throw RuntimeException("无法读取所选文件")
+            input.use { ins ->
+                FileOutputStream(tmp).use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        written += n
+                        if (written > IMPORT_MAX_ZIP_BYTES) throw RuntimeException("压缩包超过 200MB 上限")
+                        out.write(buf, 0, n)
+                    }
+                }
+            }
+            if (written == 0L) throw RuntimeException("所选文件为空")
+
+            // 2) 第一遍：只扫条目名（不读内容），找最浅的 .model3.json，并拒绝非法路径
+            var best: String? = null
+            var entryCount = 0
+            ZipInputStream(tmp.inputStream().buffered()).use { zip ->
+                var e = zip.nextEntry
+                while (e != null) {
+                    if (!e.isDirectory) {
+                        entryCount++
+                        if (entryCount > IMPORT_MAX_ENTRIES) throw RuntimeException("压缩包条目过多")
+                        val raw = e.name.replace('\\', '/')
+                        if (raw.startsWith("/") || raw.split("/").any { it == ".." }) {
+                            throw RuntimeException("压缩包包含非法路径")
+                        }
+                        val name = sanitize(raw)
+                        if (name.endsWith(".model3.json", true)) {
+                            val cur = best
+                            if (cur == null || name.count { c -> c == '/' } < cur.count { c -> c == '/' }) best = name
+                        }
+                    }
+                    zip.closeEntry()
+                    e = zip.nextEntry
+                }
+            }
+            val bestPath = best ?: throw RuntimeException("压缩包里没有 .model3.json")
+            val parts = bestPath.split("/")
+            val entryBase = parts[parts.size - 1].removeSuffix(".model3.json").trim()
+            if (entryBase.isEmpty()) throw RuntimeException("模型入口名无效")
+            val id = safeModelId(entryBase)
+            val target = modelsDir.resolve(id)
+            if (target.exists()) throw RuntimeException("已存在同名模型（" + entryBase + "），请先删除再导入")
+            val prefix = parts.dropLast(1).joinToString("/")
+
+            // 3) 第二遍：流式解压到暂存目录，累计体积、逐条校验路径
+            if (staging.exists()) staging.deleteRecursively()
+            staging.mkdirs()
+            val outBase = File(staging, safeSegment(entryBase))
+            var total = 0L
+            ZipInputStream(tmp.inputStream().buffered()).use { zip ->
+                var e = zip.nextEntry
+                while (e != null) {
+                    if (!e.isDirectory) {
+                        var rel = sanitize(e.name)
+                        if (prefix.isNotEmpty() && rel.startsWith(prefix + "/")) {
+                            rel = rel.removePrefix(prefix + "/")
+                        }
+                        val out = outBase.resolve(sanitizeSegments(rel, entryBase))
+                        out.parentFile?.mkdirs()
+                        if (!isSafeChild(out, staging)) throw RuntimeException("压缩包包含非法路径")
+                        var size = 0L
+                        FileOutputStream(out).use { o ->
+                            val buf = ByteArray(64 * 1024)
+                            while (true) {
+                                val n = zip.read(buf)
+                                if (n < 0) break
+                                size += n
+                                total += n
+                                if (size > IMPORT_MAX_ENTRY_BYTES) throw RuntimeException("压缩包内单个文件过大")
+                                if (total > IMPORT_MAX_TOTAL_BYTES) throw RuntimeException("解压后体积超过 600MB 上限")
+                                o.write(buf, 0, n)
+                            }
+                        }
+                    }
+                    zip.closeEntry()
+                    e = zip.nextEntry
+                }
+            }
+            if (outBase.walkTopDown().none { it.isFile }) throw RuntimeException("解压后没有文件")
+
+            // 4) 校验 .model3.json 及它引用的核心资源
+            val entryJson = File(outBase, entryBase + ".model3.json")
+            if (!entryJson.isFile) throw RuntimeException("找不到入口文件 " + entryBase + ".model3.json")
+            validateModelJson(entryJson, outBase)
+
+            // 5) 原子换名（换名失败则退化为复制）
+            if (!staging.renameTo(target)) {
+                staging.copyRecursively(target, overwrite = true)
+                staging.deleteRecursively()
+            }
+            return JSONObject().put("ok", true).put("id", id).put("entryBase", entryBase).toString()
+        } finally {
+            tmp.delete()
+            staging.deleteRecursively()
+        }
+    }
+
+    /** 校验 model3.json 里引用的核心文件确实存在（Moc / 全部 Textures / Physics） */
+    private fun validateModelJson(json: File, root: File) {
+        val text = json.readText(Charsets.UTF_8)
+        val obj = try {
+            JSONObject(text)
+        } catch (e: Exception) {
+            throw RuntimeException("模型配置不是合法 JSON")
+        }
+        val refs = obj.optJSONObject("FileReferences") ?: throw RuntimeException("模型配置缺少 FileReferences")
+        val moc = refs.optString("Moc", "")
+        if (moc.isNotEmpty() && !File(root, moc).isFile) throw RuntimeException("缺少模型文件：" + moc)
+        val textures = refs.optJSONArray("Textures")
+        if (textures != null) {
+            for (i in 0 until textures.length()) {
+                val t = textures.optString(i, "")
+                if (t.isNotEmpty() && !File(root, t).isFile) throw RuntimeException("缺少贴图：" + t)
+            }
+        }
+        val physics = refs.optString("Physics", "")
+        if (physics.isNotEmpty() && !File(root, physics).isFile) throw RuntimeException("缺少物理文件：" + physics)
+    }
+
+    // ================= 导入功能结束 =================
+
     @android.webkit.JavascriptInterface
     fun listInstalled(): String {
         val arr = JSONArray()
@@ -77,6 +236,8 @@ class ModelBridge(private val appContext: Context) {
             val root = modelsDir
             root.listFiles()?.forEach { dir ->
                 dir.takeIf { it.isDirectory }?.let { d ->
+                    // 跳过导入/下载的中间目录
+                    if (d.name.startsWith(".")) return@let
                     findEntryBase(d)?.let { base ->
                         // Stat metadata also invalidates cached geometry after model replacement.
                         val fingerprint = d.walkTopDown().filter { it.isFile }
@@ -90,6 +251,12 @@ class ModelBridge(private val appContext: Context) {
             }
         }
         return arr.toString()
+    }
+
+    // 给前端"删除模型"用的别名（与原有 delete 同名，保持兼容）
+    @android.webkit.JavascriptInterface
+    fun deleteModel(id: String) {
+        runCatching { modelsDir.resolve(safeSegment(id)).deleteRecursively() }
     }
 
     
@@ -118,7 +285,7 @@ class ModelBridge(private val appContext: Context) {
 
     
     private fun depthOfEntry(modelDir: File, entryBase: String): Int {
-        val dir = modelDir.resolve(safeSegment(entryBase))
+        val dir = modelDir.resolve(safeModelId(entryBase))
         val f = File(dir, "$entryBase.model3.json")
         return if (f.exists()) 0 else 1
     }
@@ -232,6 +399,15 @@ class ModelBridge(private val appContext: Context) {
     private fun sanitize(raw: String): String = raw.replace("\\", "/")
 
     private fun safeSegment(s: String): String = s.replace(Regex("[^A-Za-z0-9._-]"), "_")
+
+    /**
+     * 模型目录名：保留中文等可读字符，只清掉路径分隔符与文件系统非法字符。
+     * （原 safeSegment 会把「大肥鱼」变成 "___"，既不可读也会让前端列表显示成乱码。）
+     */
+    private fun safeModelId(s: String): String {
+        val cleaned = s.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_").trim()
+        return if (cleaned.isEmpty() || cleaned == "." || cleaned == "..") "model" else cleaned
+    }
 
     private fun encode(s: String): String = java.net.URLEncoder.encode(s, "UTF-8")
 
