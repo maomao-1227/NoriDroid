@@ -38,7 +38,19 @@ const parseBridgeResult = (raw: string): {ok: boolean; entryBase?: string; messa
 
 export const fetchModelList = async (): Promise<{id: string; name: string}[]> => {
 	const body = await fetchLive2dList()
-	return body.list ?? []
+	const official = body.list ?? []
+	// 2026-11-03: 本地已安装的自定义模型也要出现在列表里，否则导入后无法切换。
+	let installed: InstalledMeta[] = []
+	try {
+		installed = await listInstalled()
+	} catch {
+		installed = []
+	}
+	const merged: {id: string; name: string}[] = [...official]
+	for (const m of installed) {
+		if (!merged.some((x) => x.id === m.id)) merged.push({id: m.id, name: m.id})
+	}
+	return merged
 }
 
 export const listInstalled = async (): Promise<InstalledMeta[]> => {
