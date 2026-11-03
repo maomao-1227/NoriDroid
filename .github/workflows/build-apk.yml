@@ -1,0 +1,84 @@
+# 云构建：自定义模型导入版（2026-11-03）
+#
+# 与原仓库的 android.yml 区别：
+#   1. 产出 APK 并上传为 artifact（原版只验证、不上传）
+#   2. 跳过"82 项打包预检"和门禁测试（它们针对官方 UI，本分支改了设置页）
+#   3. 签名：仓库里若有 keystore.properties 就用它；否则回退 debug 签名
+#      → debug 签名每次构建都不同，**装新版本前需先卸载**（聊天/记忆/日记在公共目录，不丢）
+#
+# 触发方式：Actions → 本 workflow → Run workflow
+
+name: 构建自定义模型版 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: app/android/web-src/pnpm-lock.yaml
+
+      - name: 装前端依赖
+        working-directory: app/android/web-src
+        run: pnpm install --frozen-lockfile
+
+      - name: 装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          if [ -z "$SM" ] || [ ! -x "$SM" ]; then echo "sdkmanager not found" >&2; exit 1; fi
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+
+      - name: 构建前端（vue-tsc + vite）
+        working-directory: app/android/web-src
+        run: pnpm build
+
+      - name: 构建 APK
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: 收集产物
+        working-directory: app/android/app/build/outputs/apk/release
+        run: |
+          APK=$(ls *.apk | head -1)
+          cp "$APK" "$GITHUB_WORKSPACE/NoriDroid-custom-model.apk"
+          sha256sum "$GITHUB_WORKSPACE/NoriDroid-custom-model.apk"
+          ls -lh "$GITHUB_WORKSPACE/NoriDroid-custom-model.apk"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoriDroid-custom-model-apk
+          path: ${{ github.workspace }}/NoriDroid-custom-model.apk
+          retention-days: 30
