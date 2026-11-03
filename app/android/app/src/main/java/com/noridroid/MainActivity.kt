@@ -3,6 +3,7 @@ package com.noridroid
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.View
@@ -17,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewFeature
@@ -29,6 +31,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var assetLoader: WebViewAssetLoader
     private val modelBridge by lazy { ModelBridge(applicationContext) }
     private val chatBridge by lazy { ChatBridge(this) }
+
+    /** 自定义 Live2D 模型导入：系统文件选择器（2026-11-03 新增） */
+    private val pickModelZip = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) {
+            runCatching {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            modelBridge.importZip(uri.toString())
+        }
+    }
     /** 是否处于前台 (onPause 延迟判断悬浮窗是否要启动) */
     private var isResumed = false
     /** "离开前台"的世代号: onPause 排的延迟任务只在自己这一代仍然有效时才动手 */
@@ -63,6 +75,24 @@ class MainActivity : AppCompatActivity() {
 
         webView.addJavascriptInterface(modelBridge, "NoriBridge")
         webView.addJavascriptInterface(chatBridge, "NoriChat")
+        // 自定义模型导入入口（2026-11-03 新增）：页面调用 window.NoriImport.pick() 打开系统文件选择器
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun pick() {
+                runOnUiThread {
+                    runCatching {
+                        pickModelZip.launch(
+                            arrayOf(
+                                "application/zip",
+                                "application/x-zip-compressed",
+                                "application/octet-stream",
+                                "*/*"
+                            )
+                        )
+                    }
+                }
+            }
+        }, "NoriImport")
         chatBridge.attach(webView)
         modelBridge.attach(webView)
 
@@ -158,7 +188,15 @@ class MainActivity : AppCompatActivity() {
                 val marker = "/live2d/"
                 val idx = url.indexOf(marker)
                 if (idx < 0) return null
-                val rel = url.substring(idx + marker.length)
+                // 2026-11-03: 自定义模型的目录名可能是中文，WebView 传来的路径是百分号编码的
+                // ⇒ 先去掉 query/fragment 再解码，否则 File() 拼出来的路径找不到文件
+                val raw = url.substring(idx + marker.length).substringBefore('?').substringBefore('#')
+                if (raw.isBlank()) return null
+                val rel = try {
+                    java.net.URLDecoder.decode(raw, "UTF-8")
+                } catch (_: Exception) {
+                    raw
+                }
                 if (rel.isBlank()) return null
                 val file = File(modelBridge.modelsDir, rel)
                 if (!file.exists() || !file.isFile) return null
