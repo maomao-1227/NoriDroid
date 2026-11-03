@@ -100,7 +100,16 @@ export const createLive2D = () => {
 		if (didLoad || canvasEl) await destroyNow()
 		if (canvasEl && canvasEl.isConnected) canvasEl.remove()
 		canvasEl = null
-		await load(buildLoadConfig(model, options))
+		try {
+			await load(buildLoadConfig(model, options))
+		} catch (e) {
+			// 2026-11-03: 加载失败时库可能已经在 body 末尾挂了一张透明 canvas。
+			// 那种 canvas 铺满全屏、pointerEvents 还没被设成 none ⇒ 整屏按钮点不动
+			// （用户实测：背景还在动，但界面完全失去响应）。这里清掉再抛。
+			const orphan = document.body.querySelector(":scope > canvas") as HTMLCanvasElement | null
+			orphan?.remove()
+			throw e
+		}
 		didLoad = true
 		// 只认"body 的直接 canvas 子元素" (库挂载时新建的那个)。应用自身也有 canvas
 		// (如数据海背景), 全局 querySelector 会错抓它: Live2D 被渲染进背景画布,
