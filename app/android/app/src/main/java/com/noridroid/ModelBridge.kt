@@ -41,7 +41,7 @@ class ModelBridge(private val appContext: Context) {
         /** 解压后累计上限 */
         private const val IMPORT_MAX_TOTAL_BYTES = 600L * 1024 * 1024
         /** 解压后单文件上限 */
-        private const val IMPORT_MAX_ENTRY_BYTES = 100L * 1024 * 1024
+        private const val IMPORT_MAX_ENTRY_BYTES = 200L * 1024 * 1024
         /** 条目数上限 */
         private const val IMPORT_MAX_ENTRIES = 8000
     }
@@ -165,6 +165,14 @@ class ModelBridge(private val appContext: Context) {
                         if (prefix.isNotEmpty() && rel.startsWith(prefix + "/")) {
                             rel = rel.removePrefix(prefix + "/")
                         }
+                        // 画师源文件（PSD/PSB/CLIP）运行时用不到，且往往上百 MB：
+                        // 直接跳过，既不占空间也不会撑爆单文件上限
+                        val lower = rel.lowercase()
+                        if (lower.endsWith(".psd") || lower.endsWith(".psb") || lower.endsWith(".clip")) {
+                            zip.closeEntry()
+                            e = zip.nextEntry
+                            continue
+                        }
                         val out = outBase.resolve(sanitizeSegments(rel, entryBase))
                         out.parentFile?.mkdirs()
                         if (!isSafeChild(out, staging)) throw RuntimeException("压缩包包含非法路径")
@@ -176,7 +184,7 @@ class ModelBridge(private val appContext: Context) {
                                 if (n < 0) break
                                 size += n
                                 total += n
-                                if (size > IMPORT_MAX_ENTRY_BYTES) throw RuntimeException("压缩包内单个文件过大")
+                                if (size > IMPORT_MAX_ENTRY_BYTES) throw RuntimeException("压缩包内单个文件过大：" + rel)
                                 if (total > IMPORT_MAX_TOTAL_BYTES) throw RuntimeException("解压后体积超过 600MB 上限")
                                 o.write(buf, 0, n)
                             }
