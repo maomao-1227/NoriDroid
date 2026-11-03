@@ -802,6 +802,16 @@
 											<div v-if="modelLoadMsg" class="hint">{{ modelLoadMsg }}</div>
 										</div>
 									</section>
+									<section class="settings-basic-group settings-basic-group-model">
+										<div class="settings-basic-heading"><h3>Live2D 模型</h3></div>
+										<div class="settings-row">
+											<label>导入自定义模型</label>
+											<div class="model-pick">
+												<button class="mini ripple" @click="importModelZip">导入模型（ZIP）</button>
+											</div>
+											<div class="hint">{{ importMsg || '从手机里选一个包含 .model3.json 的 zip，导入后可在「选择模型」里切换' }}</div>
+										</div>
+									</section>
 									<section class="settings-basic-group settings-basic-group-display">
 										<div class="settings-basic-heading"><h3>显示清晰度</h3></div>
 										<div class="settings-row">
@@ -1642,6 +1652,48 @@ const layoutVer = ref(0)
 const loadingMsg = ref("加载中…")
 const modelList = ref<{id: string; name: string}[]>([])
 const listError = ref("")
+/** 自定义模型导入状态提示（2026-11-03 新增） */
+const importMsg = ref("")
+
+/** 刷新 Live2D 模型列表（官方 + 本地已装），导入成功后调用（2026-11-03 新增） */
+const refreshLive2dList = async (): Promise<void> => {
+	try {
+		modelList.value = await fetchModelList()
+		listError.value = ""
+	} catch (e: any) {
+		listError.value = "刷新模型列表失败: " + (e?.message ?? String(e))
+	}
+}
+
+/** 打开系统文件选择器，导入自定义 Live2D 模型 ZIP（2026-11-03 新增） */
+const importModelZip = (): void => {
+	const api = (window as any).NoriImport
+	if (!api || typeof api.pick !== "function") {
+		importMsg.value = "当前版本没有导入组件"
+		return
+	}
+	importMsg.value = "请选择模型 ZIP…"
+	;(window as any).__noriModelImportRes = (raw: string): void => {
+		delete (window as any).__noriModelImportRes
+		let r: {ok?: boolean; id?: string; entryBase?: string; message?: string} = {}
+		try {
+			r = JSON.parse(raw)
+		} catch {
+			r = {ok: false, message: "原生返回格式错误"}
+		}
+		if (r.ok) {
+			importMsg.value = "导入成功：" + (r.id ?? "")
+			void refreshLive2dList()
+		} else {
+			importMsg.value = "导入失败：" + (r.message || "未知错误")
+		}
+	}
+	try {
+		api.pick()
+	} catch (e: any) {
+		importMsg.value = "打开选择器失败：" + (e?.message ?? String(e))
+	}
+}
 
 const currentModel = computed(() => modelList.value.find((m) => m.id === currentModelId.value))
 /**
