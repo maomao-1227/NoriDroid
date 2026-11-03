@@ -64,6 +64,19 @@ jobs:
           yes | "$SM" --licenses > /dev/null 2>&1 || true
           "$SM" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
 
+      - name: 补丁：提高遮罩精度（Cubism 5 模型脸部遮罩错乱）
+        working-directory: app/android/web-src
+        run: |
+          F=node_modules/live2d-easy-control/live2dEasyControl.js
+          if [ -f "$F" ]; then
+            sed -i 's/_clippingMaskBufferSize = 256/_clippingMaskBufferSize = 2048/' "$F"
+            sed -i 's/_useHighPrecisionMask = !1/_useHighPrecisionMask = !0/' "$F"
+            echo "遮罩缓冲:"; grep -o "_clippingMaskBufferSize = [0-9]*" "$F" | head -1
+            echo "高精度遮罩:"; grep -o "_useHighPrecisionMask = !0" "$F" | head -1
+          else
+            echo "::warning::找不到 live2dEasyControl.js，跳过"
+          fi
+
       - name: 构建前端（vue-tsc + vite）
         working-directory: app/android/web-src
         run: pnpm build
