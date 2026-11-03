@@ -155,7 +155,8 @@ class ModelBridge(private val appContext: Context) {
             // 3) 第二遍：流式解压到暂存目录，累计体积、逐条校验路径
             if (staging.exists()) staging.deleteRecursively()
             staging.mkdirs()
-            val outBase = File(staging, safeSegment(entryBase))
+            // 必须与 target 目录用同一套命名规则，否则模型会被塞进错层目录（前端按 id 请求时 404）
+            val outBase = File(staging, safeModelId(entryBase))
             var total = 0L
             ZipInputStream(tmp.inputStream().buffered()).use { zip ->
                 var e = zip.nextEntry
